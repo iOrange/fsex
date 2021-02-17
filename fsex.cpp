@@ -1,5 +1,5 @@
 // 2021, Sergii 'iOrange' Kudlai
-// Usage: fsex.exe path/to/base.tntFolder output/folder/path
+// Usage: fsex.exe path/to/*.tntFolder output/folder/path
 
 #include <iostream>
 #include <vector>
@@ -168,106 +168,130 @@ static void fsDecyper(void* data, const size_t dataSize, uint32_t& fullKey) {
     };
 }
 
+static uint32_t fsFindDecypherKey(uint32_t marker) {
+    uint32_t result = 0;
+
+    for (size_t i = 0; i <= 255; ++i) {
+        const uint8_t h = scast<uint8_t>(i & 0xFF);
+        uint32_t initialKey = h | ((h | ((h | (h << 8)) << 8)) << 8);
+
+        uint32_t keyToTry = initialKey;
+        uint32_t tryMarker = marker;
+        fsDecyper(&tryMarker, sizeof(tryMarker), keyToTry);
+
+        if (tryMarker == 0x06054b50) {
+            result = initialKey;
+            break;
+        }
+    }
+
+    return result;
+}
+
 struct FileInfo {
     size_t offset;
     size_t keyRehashCounter;
     std::string name;
 };
 
-static const uint32_t kDataKeyInit = 0xa2a2a2a2;    // can be compile-time constant, as it depends on the game pack file name
-
 int wmain(int argc, wchar_t** argv) {
     fs::path inputPack(argv[1]);
     fs::path outputPath(argv[2]);
 
-    uint32_t fullKey = kDataKeyInit;
-
     MappedWinFile file;
     if (MapWinFile(inputPack, file)) {
         FSPakHeader hdr = *rcast<const FSPakHeader*>(file.ptr + (file.size - sizeof(FSPakHeader)));
-        fsDecyper(&hdr, sizeof(hdr), fullKey);
 
-        size_t keyRehashCounter = hdr.centralDirSize + sizeof(FSPakHeader);
+        const uint32_t initialKey = fsFindDecypherKey(hdr.magic);
+        if (!initialKey) {
+            std::cerr << "Failed to find decypher key !!!" << std::endl;
+        } else {
+            uint32_t fullKey = initialKey;
 
-        std::vector<FileInfo> files;
-        files.reserve(hdr.numCentralRecordsHere);
+            fsDecyper(&hdr, sizeof(hdr), fullKey);
 
-        // first - read through toc and collect files
-        char tmp[MAX_PATH] = {};
-        const uint8_t* tocPtr = file.ptr + hdr.centralDirOffset;
-        for (size_t i = 0; i < hdr.numCentralRecordsHere; ++i) {
-            FSPakFileRecord fileRec = *rcast<const FSPakFileRecord*>(tocPtr);
-            fsDecyper(&fileRec, sizeof(fileRec), fullKey);
+            size_t keyRehashCounter = hdr.centralDirSize + sizeof(FSPakHeader);
 
-            tocPtr += sizeof(fileRec);
-            memcpy(tmp, tocPtr, fileRec.nameLength);
-            tocPtr += fileRec.nameLength;
-            tmp[fileRec.nameLength] = 0;
-            fsDecyper(tmp, fileRec.nameLength, fullKey);
+            std::vector<FileInfo> files;
+            files.reserve(hdr.numCentralRecordsHere);
 
-            if (fileRec.sizeUncompressed != 0) {
-                FileInfo fi = {};
-                fi.offset = fileRec.relOffset;
-                fi.keyRehashCounter = keyRehashCounter;
-                fi.name = tmp;
+            // first - read through toc and collect files
+            char tmp[MAX_PATH] = {};
+            const uint8_t* tocPtr = file.ptr + hdr.centralDirOffset;
+            for (size_t i = 0; i < hdr.numCentralRecordsHere; ++i) {
+                FSPakFileRecord fileRec = *rcast<const FSPakFileRecord*>(tocPtr);
+                fsDecyper(&fileRec, sizeof(fileRec), fullKey);
 
-                files.push_back(fi);
-            }
+                tocPtr += sizeof(fileRec);
+                memcpy(tmp, tocPtr, fileRec.nameLength);
+                tocPtr += fileRec.nameLength;
+                tmp[fileRec.nameLength] = 0;
+                fsDecyper(tmp, fileRec.nameLength, fullKey);
 
-            keyRehashCounter += fileRec.nameLength + sizeof(FSPakLocalFileHeader);
+                if (fileRec.sizeUncompressed != 0) {
+                    FileInfo fi = {};
+                    fi.offset = fileRec.relOffset;
+                    fi.keyRehashCounter = keyRehashCounter;
+                    fi.name = tmp;
 
-            const size_t keyRehashTimes = fileRec.extraFieldLen + fileRec.commentLen;
-            for (size_t j = 0; j < keyRehashTimes; ++j) {
-                fullKey = (0x1D * fullKey + 0x1B) % 0x72EBCAFE;
-            }
-        }
-
-        // now unpack files
-        for (const auto& fi : files) {
-            fullKey = kDataKeyInit;
-            for (size_t j = 0; j < fi.keyRehashCounter; ++j) {
-                fullKey = (0x1D * fullKey + 0x1B) % 0x72EBCAFE;
-            }
-
-            FSPakLocalFileHeader localHeader = *rcast<const FSPakLocalFileHeader*>(file.ptr + fi.offset);
-            fsDecyper(&localHeader, sizeof(localHeader), fullKey);
-
-            std::cout << "Extracting " << fi.name << " of size " << localHeader.sizeUncompressed << " bytes...    ";
-
-            const uint8_t* dataPtr = file.ptr + fi.offset + sizeof(FSPakLocalFileHeader);
-            dataPtr += localHeader.nameLength + localHeader.extraFieldLen;
-
-            fs::path fullPath = outputPath / fi.name;
-            std::error_code ec;
-            fs::create_directories(fullPath.parent_path(), ec);
-
-            if (!localHeader.compression) {
-                if (!DumpToWinFile(fullPath, dataPtr, localHeader.sizeUncompressed)) {
-                    std::cout << "!!! Failed to write file !!!" << std::endl;
-                } else {
-                    std::cout << "SUCCEEDED" << std::endl;
+                    files.push_back(fi);
                 }
-            } else {
-                std::vector<uint8_t> u_data(localHeader.sizeUncompressed);
 
-                z_stream streamIn = {};
-                streamIn.next_in = (uint8_t*)dataPtr;
-                streamIn.avail_in = localHeader.sizeCompressed;
-                streamIn.next_out = u_data.data();
-                streamIn.avail_out = localHeader.sizeUncompressed;
-                inflateInit2_(&streamIn, -15, ZLIB_VERSION, sizeof(z_stream));
+                keyRehashCounter += fileRec.nameLength + sizeof(FSPakLocalFileHeader);
 
-                int res = inflate(&streamIn, Z_FINISH);
-                inflateEnd(&streamIn);
+                const size_t keyRehashTimes = fileRec.extraFieldLen + fileRec.commentLen;
+                for (size_t j = 0; j < keyRehashTimes; ++j) {
+                    fullKey = (0x1D * fullKey + 0x1B) % 0x72EBCAFE;
+                }
+            }
 
-                if (Z_STREAM_END == res) {
-                    if (!DumpToWinFile(fullPath, u_data.data(), u_data.size())) {
+            // now unpack files
+            for (const auto& fi : files) {
+                fullKey = initialKey;
+                for (size_t j = 0; j < fi.keyRehashCounter; ++j) {
+                    fullKey = (0x1D * fullKey + 0x1B) % 0x72EBCAFE;
+                }
+
+                FSPakLocalFileHeader localHeader = *rcast<const FSPakLocalFileHeader*>(file.ptr + fi.offset);
+                fsDecyper(&localHeader, sizeof(localHeader), fullKey);
+
+                std::cout << "Extracting " << fi.name << " of size " << localHeader.sizeUncompressed << " bytes...    ";
+
+                const uint8_t* dataPtr = file.ptr + fi.offset + sizeof(FSPakLocalFileHeader);
+                dataPtr += localHeader.nameLength + localHeader.extraFieldLen;
+
+                fs::path fullPath = outputPath / fi.name;
+                std::error_code ec;
+                fs::create_directories(fullPath.parent_path(), ec);
+
+                if (!localHeader.compression) {
+                    if (!DumpToWinFile(fullPath, dataPtr, localHeader.sizeUncompressed)) {
                         std::cout << "!!! Failed to write file !!!" << std::endl;
                     } else {
                         std::cout << "SUCCEEDED" << std::endl;
                     }
                 } else {
-                    std::cout << "!!! Decompression FAILED !!!" << std::endl;
+                    std::vector<uint8_t> u_data(localHeader.sizeUncompressed);
+
+                    z_stream streamIn = {};
+                    streamIn.next_in = (uint8_t*)dataPtr;
+                    streamIn.avail_in = localHeader.sizeCompressed;
+                    streamIn.next_out = u_data.data();
+                    streamIn.avail_out = localHeader.sizeUncompressed;
+                    inflateInit2_(&streamIn, -15, ZLIB_VERSION, sizeof(z_stream));
+
+                    int res = inflate(&streamIn, Z_FINISH);
+                    inflateEnd(&streamIn);
+
+                    if (Z_STREAM_END == res) {
+                        if (!DumpToWinFile(fullPath, u_data.data(), u_data.size())) {
+                            std::cout << "!!! Failed to write file !!!" << std::endl;
+                        } else {
+                            std::cout << "SUCCEEDED" << std::endl;
+                        }
+                    } else {
+                        std::cout << "!!! Decompression FAILED !!!" << std::endl;
+                    }
                 }
             }
         }
@@ -277,3 +301,8 @@ int wmain(int argc, wchar_t** argv) {
 
     return 0;
 }
+
+// Version history:
+// v0.3 - added run-time pack name hash calculation to get inital key to support archives from Hover Ace
+// v0.2 - fixed unpacking of uncompressed files
+// v0.1 - first implementation
